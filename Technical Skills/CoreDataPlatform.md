@@ -1,260 +1,271 @@
-## Data Platform — CDC Ingestion & Real-Time Serving Architecture
+## CoreData Platform — Ingestion, Aggregation & Multi-Consumer Publishing
 
-### Change-Data-Capture Pipeline, Multi-Consumer Fan-Out & Zero-Downtime Evolution
+### Polling-Based CDC · Kinesis Fan-In / Fan-Out · Denormalized Staging → Normalized CoreData · Search & Notification Delivery
 
 ## Project Overview
 
-The Data Platform ingests changes from multiple legacy systems and serves them, in near real time, to internal clients, downstream subscribers, and an analytics estate — **without dual-write drift and without read-path outages**, even while the schema is evolving.
+The CoreData platform ingests financial data changes from multiple upstream sources, aggregates them into a canonical normalized store, and publishes them out to search, subscribers, and analytics — reliably and in near real time.
 
-The platform is built from four independent flows:
+The platform is built from a few clearly separated flows:
 
-- **Ingestion** — Change Data Capture (CDC) from the source-of-record database log into a durable event stream
-- **Serving** — a JWT-secured REST API that reads the canonical store and a fast search index
-- **Distribution** — a transactional outbox that delivers ordered change batches to external subscribers
-- **Analytics** — a nightly columnar snapshot that keeps heavy reporting off the transactional path
+- **Ingestion (fan-in)** — a polling-based CDC service and many other upstream producers feed a single inbound event stream
+- **Aggregation** — a consumer lands data in **denormalized staging tables**, then assembles them into **normalized CoreData tables**
+- **Publishing (fan-out)** — outbound events drive a search index and consumer notifications
+- **Analytics** — a scheduled snapshot job publishes columnar data to a data lake for reporting
 
-Together these let clients read fresh data instantly, subscribers consume an ordered event feed, and analysts query the full dataset — each on its own failure domain.
+Each stage is an independently deployable service on its own failure domain, connected only through durable Kinesis streams.
 
 ## Business Context
 
-The organisation ran **four legacy databases** as the systems of record, but consumers needed capabilities those databases could not serve directly: fast full-text search, an event feed for partner systems, and ad-hoc analytics over the whole dataset.
+Financial data changes originate in multiple upstream systems, and many downstream consumers need that data in different shapes — some need to **search** it, some need to be **notified** of every change, and some need **bulk snapshots** for analytics.
 
-The naive approach — have every application **dual-write** to each downstream store — is a well-known trap: two writes across two systems are not atomic, so on any partial failure the stores drift apart silently and permanently.
+Rather than couple every producer directly to every consumer, the platform funnels all changes into a single **inbound stream**, aggregates them centrally into a normalized model, and then fans them back out through an **outbound stream**. This keeps producers and consumers decoupled and lets each side scale and fail independently.
 
 Every day the platform handles:
 
-- Change events from **four source systems**, captured in commit order
-- Near-real-time propagation to a **search index** and to **downstream subscribers**
-- Millions of read requests on the serving API
-- A full analytical snapshot of the dataset for reporting
+- Change events from a **polling-based CDC** service plus **many upstream producers** (for example **PST**, **ESG**, and others)
+- Central aggregation from **multiple denormalized staging tables** into **normalized CoreData tables**
+- Near-real-time fan-out to a **search index** and **notification topics**
+- Scheduled **snapshot exports** to a data lake for analytics
 
-The platform had to remain highly available, keep the read path fast, and let any single component fail without taking the system down.
+The platform had to stay highly available, keep ingestion decoupled from delivery, and let any single component fail without stopping the pipeline.
 
 ## System Overview
 
 ```mermaid
 flowchart LR
-    subgraph Sources["Sources & Clients"]
-        Legacy[("Legacy Databases<br/>source-1..4")]
-        IdP["Identity Provider<br/>OAuth2 / JWT"]
-        Clients["Client Apps / Internal"]
+    subgraph Producers["Upstream Producers"]
+        Proxy["pub-proxy (ECS / Spring Boot)<br/>polling-based CDC"]
+        PST["PST"]
+        ESG["ESG"]
+        More["... many others"]
     end
 
-    subgraph Ingest["Ingestion & API Edge"]
-        CDC["replication-svc (CDC)"]
-        Kafka[("Kinesis Streams<br/>inbound · xref · outbound")]
-        ALB["Application Load Balancer"]
-        API["data-api"]
+    subgraph Ingest["Ingestion & Aggregation"]
+        Inbound[("Kinesis inbound stream")]
+        Agg["pub-aggregator (ECS / Spring Boot)"]
     end
 
-    subgraph Svc["Services"]
-        EH["event-handler"]
-        ESW["es-writer"]
-        ESP["es-proxy"]
+    subgraph Store["System of Record — RDS MySQL"]
+        Staging[("staging tables<br/>denormalized · many tables")]
+        Core[("coredata tables<br/>normalized · one entity per table")]
     end
 
-    subgraph Data["Data Stores"]
-        DDB[("DynamoDB<br/>CDC checkpoints")]
-        MySQL[("RDS MySQL<br/>system of record")]
-        ES[("Elasticsearch<br/>search index")]
-        S3[("Amazon S3<br/>Parquet lake")]
+    subgraph Fanout["Publishing & Delivery"]
+        Outbound[("Kinesis outbound stream")]
+        ESL["ES lambda"]
+        NL["notif lambda"]
+        OS[("OpenSearch (ES)")]
+        SNS["SNS topics"]
     end
 
-    subgraph Deliver["Delivery & Analytics"]
-        Outbox["pub-aggregator / pub-proxy"]
-        Subs["Subscriber Apps"]
-        Snap["snapshot-api"]
-        Athena["Athena / Spark"]
-    end
+    Consumers["Consumers"]
 
-    Legacy -- binlog CDC --> CDC
-    CDC -- checkpoint --> DDB
-    CDC --> Kafka
-    Kafka --> EH --> MySQL
-    Kafka --> ESW --> ES
-    Clients -- HTTPS + JWT --> ALB --> API
-    IdP -. verify JWT .-> API
-    API --> ESP --> ES
-    API -- read/write --> MySQL
-    MySQL --> Outbox --> Subs
-    MySQL --> Snap --> S3 --> Athena
+    Proxy --> Inbound
+    PST --> Inbound
+    ESG --> Inbound
+    More --> Inbound
+    Inbound --> Agg
+    Agg -- land denormalized --> Staging
+    Staging -- assemble normalized --> Core
+    Agg -- publish --> Outbound
+    Outbound --> ESL --> OS
+    Outbound --> NL --> SNS
+    OS -- query --> Consumers
+    SNS -- notify --> Consumers
 ```
 
 ## Existing Challenges
 
-Serving multiple consumers from legacy systems of record was difficult because each consumer had different needs, and the sources could not be changed:
+Serving many consumers from many upstream sources was difficult because each side had different needs and cadences:
 
-- The legacy databases had to remain the **single source of truth** — no consumer could be allowed to become authoritative.
-- Changes occurred continuously and had to be reflected downstream **almost immediately**.
-- Multiple downstream systems depended on the **same** change data, at different speeds.
-- Search required a **denormalised** representation the relational store could not serve efficiently.
-- Analytics required **full-dataset scans** that would compete with production traffic if run against the live database.
-- Any solution had to allow the schema to **evolve under live traffic** without an outage.
-
-The platform needed to satisfy all of these while staying scalable and easy to extend for future consumers.
+- **Many heterogeneous producers** (polling CDC, PST, ESG, and others) had to feed one consistent pipeline.
+- Incoming data arrived in **denormalized** form and had to be reshaped into a **normalized** canonical model.
+- Different consumers needed the same data in different ways — **searchable**, **push-notified**, or as **bulk snapshots**.
+- Producers and consumers had to stay **decoupled** so neither could stall the other.
+- Failures in any single component (a lambda, a consumer, the search index) could not be allowed to block ingestion.
 
 ## Architecture Approach
 
-Instead of asking every application to write to every downstream store, the platform captures **what was actually committed** to the source database (via its change log) and treats that stream as the single source of truth.
+The platform funnels all change events into a single **Kinesis inbound stream** (fan-in), aggregates them in one place, and then republishes them through a **Kinesis**utbound stream** (fan-out) to independent delivery paths.
 
-From there, changes **fan out** to independent consumers — each with its own checkpoint, its own deployment, and its own failure domain. One consumer materialises the canonical store, another builds the search index, another relays an event feed to subscribers.
+`pub-proxy` acts as the polling-based CDC producer; `pub-aggregator` is the single consumer that owns the write to the system of record and the handoff to the outbound stream. Everything downstream of the outbound stream — search indexing and consumer notification — is an independent, isolated path.
 
-Ingestion, serving, distribution, and analytics were separated into independent services so they could scale and fail independently. Every service is a **stateless container**, so scaling and recovery are routine.
+All services are **stateless containers on ECS**, connected only through durable streams, so scaling and recovery are routine and no component is tightly coupled to another.
 
-## Change-Data-Capture Ingestion Flow
+## Ingestion & Aggregation Flow
+
+Incoming events are first landed into **denormalized staging tables** (the staging schema can hold many such tables). The **normalized CoreData model is then assembled from multiple staging tables**, producing clean canonical entities — **one entity per CoreData table**. Once the normalized write is complete, the aggregator publishes to the outbound stream.
 
 ```mermaid
 flowchart TD
-    Legacy[("Legacy Database")] -- commit --> Binlog["MySQL Binary Log"]
-    Binlog -- read --> CDC["replication-svc (CDC)"]
-    CDC -- store position --> Checkpoint[("DynamoDB checkpoint")]
-    CDC -- publish event --> Kafka[("Kinesis Streams")]
-    Kafka --> Inbound["inbound stream"]
-    Kafka --> Xref["xref stream"]
-    Kafka --> Outbound["outbound stream"]
-    Inbound --> EH["event-handler"]
-    Xref --> ESW["es-writer"]
-    EH --> MySQL[("RDS MySQL<br/>system of record")]
-    ESW --> ES[("Elasticsearch")]
+    Proxy["pub-proxy<br/>polling-based CDC"] --> Inbound[("Kinesis inbound stream")]
+    PST["PST"] --> Inbound
+    ESG["ESG"] --> Inbound
+    More["... many others"] --> Inbound
+    Inbound --> Agg["pub-aggregator (ECS / Spring Boot)"]
+
+    Agg -- land denormalized --> S1[("staging table A")]
+    Agg -- land denormalized --> S2[("staging table B")]
+    Agg -- land denormalized --> S3[("staging table C")]
+
+    S1 --> Build{{"assemble normalized<br/>from multiple staging tables"}}
+    S2 --> Build
+    S3 --> Build
+    Build --> Core[("coredata tables<br/>one entity per table")]
+
+    Agg -- publish --> Outbound[("Kinesis outbound stream")]
 ```
 
 ## Ingestion Sequence
 
 ```mermaid
 sequenceDiagram
-    participant Legacy as Legacy DB
-    participant CDC as replication-svc
-    participant Chk as DynamoDB
-    participant Stream as Kinesis
-    participant EH as event-handler
-    participant ESW as es-writer
-    Legacy->>CDC: Row change in binlog
-    CDC->>Stream: Publish structured event
-    CDC->>Chk: Advance checkpoint (after publish)
-    Stream->>EH: Deliver event (inbound)
-    EH->>EH: Validate referential integrity
-    EH->>EH: Commit to MySQL (in transaction)
-    Stream->>ESW: Deliver event (xref)
-    ESW->>ESW: Index document into Elasticsearch
+    participant Src as Source data
+    participant Proxy as pub-proxy (CDC)
+    participant In as Kinesis inbound
+    participant Agg as pub-aggregator
+    participant Stg as staging tables (denormalized)
+    participant Core as coredata tables (normalized)
+    participant Out as Kinesis outbound
+    Proxy->>Src: Poll for changes (acts as CDC)
+    Proxy->>In: Publish change event
+    Note over In: PST / ESG / many others also publish here
+    In->>Agg: Deliver inbound event
+    Agg->>Stg: Land data into staging (many denormalized tables)
+    Agg->>Core: Assemble normalized entities from multiple staging tables
+    Note over Core: one entity per coredata table
+    Agg->>Out: Publish to outbound stream
 ```
 
-## Real-Time Serving & Search
+## Publishing & Delivery Flow
 
-Persisting the change is only half the story. Clients needed fast reads and full-text search that the relational store could not provide efficiently.
+Once `pub-aggregator` completes the normalized write, it publishes the change to the **outbound stream**, which drives two independent delivery paths:
 
-Whenever a change flows through the stream, `es-writer` indexes a denormalised document into **Elasticsearch**. The serving API (`data-api`) reads canonical data from MySQL and delegates search to a thin authorisation gateway (`es-proxy`). Because search is populated by an **independent consumer**, the search index can be rebuilt from the stream at any time and can be down without ever blocking a write to the source of record.
+- **ES lambda** indexes the record into **OpenSearch**, so consumers can query the data.
+- **notif lambda** publishes to **SNS topics**, so subscribed consumers are notified that new data has arrived.
 
-## Serving Sequence
+Consumers therefore receive data two complementary ways — a **push notification** via SNS, and a **queryable index** in OpenSearch.
+
+```mermaid
+flowchart LR
+    Outbound[("Kinesis outbound stream")] --> ESL["ES lambda"]
+    Outbound --> NL["notif lambda"]
+    ESL --> OS[("OpenSearch (ES)")]
+    NL --> SNS["SNS topics"]
+    OS -- query --> Con["Consumers"]
+    SNS -- notify --> Con
+```
+
+## Delivery Sequence
 
 ```mermaid
 sequenceDiagram
-    participant Client
-    participant ALB
-    participant API as data-api
-    participant Proxy as es-proxy
-    participant ES as Elasticsearch
-    participant MySQL
-    Client->>ALB: GET /search + Bearer JWT
-    ALB->>API: Route to container
-    API->>API: Validate JWT locally (cached JWKs)
-    API->>Proxy: Authorized search request
-    Proxy->>ES: Term query
-    ES-->>Proxy: Matching documents
-    API->>MySQL: Read canonical fields
-    API-->>Client: Paginated response
+    participant Out as Kinesis outbound
+    participant ESL as ES lambda
+    participant OS as OpenSearch
+    participant NL as notif lambda
+    participant SNS as SNS topics
+    participant Con as Consumer
+    Out->>ESL: Deliver outbound record
+    ESL->>OS: Index document
+    Out->>NL: Deliver outbound record
+    NL->>SNS: Publish notification
+    SNS->>Con: Notify (consumer subscribed)
+    Con->>OS: Query the indexed data
 ```
 
 ## Key Engineering Decisions
 
-#### Change Data Capture as the single source of truth
+#### Polling-based CDC via `pub-proxy`
 
-Rather than dual-writing from applications, the platform reads the source database's binary log. This inherits the database's atomicity for free — we replicate exactly what was committed, in commit order — so the downstream stores can never silently diverge from the source.
+`pub-proxy` polls the upstream source and emits change events, acting as a change-data-capture producer. This lets the platform ingest changes without the sources having to push directly to every downstream — the change stream becomes the shared contract.
 
-#### Checkpointed, restart-safe ingestion
+#### Single inbound stream (fan-in)
 
-`replication-svc` records its binlog position in DynamoDB and only advances the checkpoint **after** publishing. If the service restarts, it resumes exactly where it left off — never losing a change, at worst re-publishing the last few (handled by idempotent consumers).
+Many producers — `pub-proxy`, PST, ESG, and others — publish to one **Kinesis inbound stream**. Consolidating producers behind a single stream keeps the aggregation logic in one place and decouples every producer from every consumer.
 
-#### Durable event stream with replay
+#### Denormalized staging → normalized CoreData
 
-Kinesis provides a durable, ordered, retained event stream. Its retention window acts as a **replay buffer**: a consumer can be down for hours and simply catch up, and the search index can be fully rebuilt from the stream after an incident.
+`pub-aggregator` first lands incoming data into **denormalized staging tables** — the staging schema can hold **many** tables. The **normalized CoreData model is then assembled by combining multiple staging tables** into clean canonical entities, with **one entity per CoreData table**. This two-step landing-then-normalize approach absorbs the varied shapes of many producers while keeping the canonical model consistent.
 
-#### Independent, single-purpose consumers
+#### Outbound stream for fan-out
 
-Each downstream (`event-handler` → MySQL, `es-writer` → Elasticsearch, outbox → subscribers) is a separate consumer with its own checkpoint. This isolates failure domains — one downstream failing never blocks the others.
+After the normalized write, `pub-aggregator` republishes to a **Kinesis outbound stream**. This cleanly separates *ingestion* from *delivery*: the outbound consumers (search, notification) evolve and fail independently of ingestion.
 
-#### Stateless services on managed compute
+#### Lambda-based delivery
 
-Every service runs as a stateless container behind a load balancer, with all state pushed to managed stores. Scaling and recovery are boring by design, and infrastructure is defined as code so environments are reproducible.
-
-## Distribution to Subscribers
-
-External subscribers needed a reliable, ordered feed of changes — delivered even if a subscriber was temporarily offline.
-
-The platform uses the **transactional outbox** pattern: change records are written to an outbox table in the *same* transaction as the business write, so the notification can never be lost or emitted for an uncommitted change. A relay tracks each change per consumer as `PENDING → SENT → ACKNOWLEDGED` and delivers ordered batches. A subscriber that was offline simply resumes from its cursor — downtime becomes lag, not data loss.
-
-## Distribution Sequence
-
-```mermaid
-sequenceDiagram
-    participant MySQL as System of Record
-    participant Outbox as pub-aggregator
-    participant Sub as Subscriber App
-    MySQL->>Outbox: Append change (same transaction)
-    Note over Outbox: state PENDING
-    Sub->>Outbox: Poll "anything new after my cursor?"
-    Outbox->>Sub: Ordered batch of changes
-    Note over Outbox: state SENT
-    Sub-->>Outbox: Acknowledge batch
-    Note over Outbox: state ACKNOWLEDGED
-```
+The outbound stream is consumed by lightweight, independently-scaling **lambdas** — one for search indexing (**ES lambda → OpenSearch**) and one for consumer notification (**notif lambda → SNS**) — so each delivery concern is isolated.
 
 ## Analytics — Off the Hot Path
 
-Analysts needed full-dataset queries, but running large scans against the live transactional database would compete with production reads and writes.
+Consumers also needed **bulk snapsh**s** of the data for analytics and reporting. Running large scans against the live transactional database would compete with production traffic, so snapshots are produced by a separate scheduled service.
 
-A nightly **Spring Batch** job (`snapshot-api`) exports the source of record to columnar **Parquet** files on **S3**, which **Athena** queries directly. This keeps heavy analytical scans entirely off the OLTP path, and the columnar format makes those scans far cheaper than raw exports. The trade-off — analytics data is up to a day old — is deliberate and acceptable for reporting.
+`snapshot-api` reads from **MySQL / MSSQL** on both an **incremental** and a **daily** cadence, generates **CSV**, converts it to columnar **Parquet** using **Spark**, uploads the Parquet to **S3**, and then publishes an **SNS notification containing the S**paths** so consumers know exactly where to pick up the latest snapshot.
+
+## Snapshot Flow
+
+```mermaid
+flowchart LR
+    DB[("MySQL / MSSQL")] -- incremental & daily --> Snap["snapshot-api"]
+    Snap --> CSV["CSV files"]
+    CSV -- Spark --> Parquet["Parquet"]
+    Parquet --> S3[("Amazon S3")]
+    S3 --> SNS["SNS (S3 path notification)"]
+    SNS --> Con["Consumers"]
+```
+
+## Snapshot Sequence
+
+```mermaid
+sequenceDiagram
+    participant Snap as snapshot-api
+    participant DB as MySQL / MSSQL
+    participant Spark as Spark
+    participant S3 as Amazon S3
+    participant SNS as SNS
+    participant Con as Consumer
+    Snap->>DB: Read data (incremental & daily)
+    Snap->>Snap: Generate CSV
+    Snap->>Spark: Convert CSV to Parquet
+    Spark->>S3: Upload Parquet files
+    Snap->>SNS: Publish notification with S3 paths
+    SNS->>Con: Deliver S3 paths
+```
 
 ## Design Decisions
 
-### Read/write separation (CQRS-style)
+### Decoupling through streams
 
-The relational store is the book of record; Elasticsearch is a denormalised read model for search. The platform accepts **eventual consistency** between them in exchange for search performance the relational store cannot provide.
+Producers and consumers never call each other directly — they communicate only through the **inbound** and **outbound** Kinesis streams. This loose coupling lets each side scale independently and absorbs bursts without back-pressuring producers.
 
-### Idempotency everywhere
+### Denormalized landing, normalized truth
 
-Because delivery is at-least-once (retries, replays, redelivery all re-present messages), every consumer is idempotent — deduplicating by change id or using upserts — so re-processing is always safe.
+Landing into **denormalized staging tables** lets the platform absorb the varied, source-shaped data from many producers without friction. Assembling the **normalized CoreData tables** from those staging tables then produces a clean, canonical model — one entity per table — that downstream delivery can rely on.
 
-### Zero-downtime schema evolution
+### Idempotent processing
 
-Schema changes use **expand / contract**: add the new shape, dual-write, backfill old rows, switch reads behind a flag, then drop the old shape last. Every step is backward-compatible, so the schema can evolve under live traffic with no outage.
+Because stream delivery is at-least-once (retries and reprocessing can re-present records), the aggregator and lambdas are designed so that re-processing the same change is safe.
 
-## Trade-Offs That Give the Platform Its Edge
+### Isolated delivery paths
 
-Every deliberate trade-off spends *strong consistency or freshness* to buy *availability, isolation, and recoverability* — the right currency for a platform whose job is to keep serving when a component fails.
-
-| Accepted | To gain | The edge it gives |
-| --- | --- | --- |
-| Eventual consistency between MySQL and Elasticsearch | Independent failure domains | Search can be fully down while writes to the source of record never stop; search rebuilds from the stream |
-| More moving parts and write amplification (CDC + fan-out vs a simple dual-write) | Atomicity and replay | Stores can never silently diverge; stream retention turns any consumer outage into lag, not loss |
-| Analytics data up to ~24h old (nightly snapshots) | Protection of the transactional path | Large analytical scans never compete with production; columnar Parquet makes them far cheaper |
-
-The through-line: **capture what was actually committed, then fan out to isolated consumers.** That single decision is why the platform is atomic, replayable, and resilient.
+Search indexing and consumer notification are separate lambdas on the outbound stream, so if one path (e.g. OpenSearch indexing) is degraded, the other (SNS notification) keeps working.
 
 ## Business Impact
 
 The platform successfully enabled:
 
-- **Unified ingestion** from four legacy systems of record via change data capture, with no dual-write drift
-- **Near-real-time search** kept fresh by an independent indexing consumer
-- **Reliable, ordered distribution** to external subscribers via a transactional outbox with per-consumer cursors
-- **Self-healing recovery** — restarted services resume from a checkpoint; offline subscribers catch up from the stream
-- **Analytics at scale** on a columnar data lake, entirely isolated from the transactional path
-- **Zero-downtime schema evolution** under live traffic using the expand/contract pattern
+- **Unified fan-in** of many heterogeneous producers (polling CDC, PST, ESG, and others) into a single inbound stream
+- **Central aggregation** from **multiple denormalized staging tables** into **normalized CoreData tables** (one entity per table) in RDS MySQL
+- **Near-real-time fan-out** via an outbound stream to search (OpenSearch) and notifications (SNS)
+- **Two complementary delivery modes** for consumers — push notification and queryable index
+- **Resilient, idempotent, at-least-once processing** across the pipeline
+- **Analytics at scale** via scheduled CSV → Parquet → S3 snapshots with S3-path notifications, fully isolated from the transactional path
 
-The architecture significantly improved maintainability by separating each consumer from the core ingestion pipeline, while allowing the platform to scale and add new consumers with minimal change.
+The architecture kept producers and consumers decoupled through durable streams, allowing each stage to scale and fail independently while remaining easy to extend with new producers and delivery paths.
 
 ## Key Learnings
 
-This project deepened my understanding of change data capture, event-driven fan-out, and building systems that stay correct and available as they evolve.
+This project deepened my understanding of stream-based fan-in/fan-out design, landing denormalized data before assembling a normalized canonical model, and building delivery paths that stay independent and resilient.
 
-More importantly, it reinforced that good architecture is less about picking technologies and more about picking the **one foundational decision** correctly — here, treating the committed change log as the single source of truth — and then letting every downstream benefit from atomicity, replay, and isolation. The trade-offs all point the same direction, which is what makes it a designed system rather than an accreted one.
+More importantly, it reinforced that a durable stream as the integration backbone — with one place that owns aggregation and the write to the system of record — is what keeps a multi-producer, multi-consumer platform decoupled, recoverable, and simple to extend.
