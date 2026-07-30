@@ -1,0 +1,13 @@
+## Question 1: Is there any situation that describes an unconventional route taken in your experience?
+**Answer:** Yes. One unconventional route I took was using AI as a practical productivity tool while still relying on my own engineering judgment. I used it to speed up requirement analysis, explore design options, identify edge cases, prepare test scenarios, and improve documentation.
+I validated every suggestion using my experience in Java, Spring Boot, microservices, and AWS. This helped me work faster, adapt to modern ways of delivery, and provide better solutions without compromising quality, ownership, or client expectations.
+
+## Question 2: Do you recall a situation where you intensely and relentlessly focused to completa a task (can be professional work or hobby) that helped you grow?
+**Answer:** Yes. I once focused deeply on expanding beyond Java and Spring Boot into cloud computing, microservices, and distributed systems. I created a structured learning plan and studied consistently alongside my project responsibilities.
+I practised through real-world scenarios and system-design problems until I could explain complex topics clearly. This effort improved my technical confidence, strengthened my problem-solving skills, and helped me evaluate trade-offs more effectively in client-facing work.
+
+## Question 3: Describe an experience of joining new team, project or environment where there was significant amount of context, information or complexity to absorb in a relatively short period of time. How did you approach learning, building clarity, prioritizing what to focus on and gradually becoming effective?
+**Answer:** When I joined a financial-data platform project, I had to absorb a large amount of business and technical context within a short period. I began by understanding the client’s objectives, key business requirements, and the platform’s overall workflow.
+Rather than trying to learn the entire system at once, I selected one critical business process and followed it from start to finish. I reviewed the related documentation and code, mapped the technical dependencies, and prepared focused questions for experienced team members. This helped me gradually build a clear understanding of how the different parts of the platform worked together.
+ I prioritized the knowledge required for my immediate responsibilities and gradually progressed from smaller tasks to more complex work. Code reviews, team discussions, and regular feedback helped me validate my understanding and correct assumptions early. This structured approach enabled me to become effective quickly, contribute with confidence, and keep my work aligned with client expectations and business outcomes.
+
