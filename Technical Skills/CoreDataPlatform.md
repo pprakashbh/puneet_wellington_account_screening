@@ -264,6 +264,24 @@ The platform successfully enabled:
 
 The architecture kept producers and consumers decoupled through durable streams, allowing each stage to scale and fail independently while remaining easy to extend with new producers and delivery paths.
 
+## My Role & Contribution
+
+As a **backend and cloud engineer**, I designed, built, and supported the CoreData ingestion → aggregation → publishing pipeline end to end on AWS. My work spanned the microservices, the event backbone, the data layer, security, CI/CD, and observability.
+
+| Area | What I did | Tech stack |
+| --- | --- | --- |
+| **Ingestion / CDC** | Built `pub-proxy`, a Spring Boot service on ECS that polls upstream sources and acts as a CDC producer onto the Kinesis inbound stream | Java, Spring Boot, ECS, Kinesis |
+| **Aggregation** | Owned `pub-aggregator` — the single inbound consumer that lands denormalized data into multiple staging tables, assembles normalized CoreData entities (one per table) in RDS MySQL, and republishes to the outbound stream | Java, Spring Boot, Spring Integration, ECS, Kinesis, RDS MySQL, JPA/Hibernate, Flyway |
+| **Publishing / fan-out** | Built the ES lambda (index into OpenSearch) and notif lambda (publish to SNS) as isolated delivery paths | AWS Lambda, Kinesis, OpenSearch, SNS |
+| **Analytics** | Developed `snapshot-api` — a Spring Batch job that reads MySQL/MSSQL (incremental & daily), generates CSV, converts to Parquet via Spark, uploads to S3, and notifies consumers with S3 paths via SNS | Java, Spring Boot, Spring Batch, MySQL/MSSQL, Spark, S3, SNS |
+| **APIs & integration** | Developed REST APIs and event-driven components, combining synchronous REST with asynchronous streaming | Spring Boot, REST, Kinesis/SNS/SQS |
+| **Cloud security** | Implemented authentication, authorization, encryption, and secrets management | Cognito, OAuth2/JWT, KMS, Secrets Manager, Parameter Store |
+| **CI/CD & IaC** | Automated build, containerization, deployment, provisioning, and DB migrations | Bitbucket Pipelines, Docker, CloudFormation, Terraform, Gradle, Flyway |
+| **Reliability & ops** | Applied resilient design (centralized config, structured exception handling, health checks, idempotent at-least-once processing); wired in observability and owned production support | CloudWatch, logging, automated testing, Agile |
+
+**In one line:** I built a Spring Boot polling-CDC producer feeding a Kinesis inbound stream, a Spring Boot aggregator that lands denormalized staging data and assembles normalized CoreData entities in RDS MySQL before republishing to a Kinesis outbound stream, and Lambda-based fan-out to OpenSearch and SNS — plus the `snapshot-api` analytics job, and the cloud security, CI/CD, IaC, and observability that made it production-ready.
+
+
 ## Key Learnings
 
 This project deepened my understanding of stream-based fan-in/fan-out design, landing denormalized data before assembling a normalized canonical model, and building delivery paths that stay independent and resilient.
