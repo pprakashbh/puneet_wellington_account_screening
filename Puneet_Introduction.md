@@ -10,7 +10,7 @@ I'm a **Java and AWS cloud engineer** who designs and delivers backend platforms
 
 For the last several years I've worked on **financial data platforms**, building systems that **ingest, transform, aggregate, and publish** data on AWS. I care about the whole lifecycle, not just the code that ships: security, CI/CD, infrastructure automation, testing, observability, and production support — so that what I build is dependable in production and easy to operate.
 
-My guiding principle is simple: **design for the day it breaks, not just the day it ships.**
+My guiding principle is simple: **Focus on long-term reliability, maintenance, and failure management rather than just the initial launch**
 
 ---
 
