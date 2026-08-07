@@ -53,8 +53,8 @@ flowchart LR
 
     subgraph Fanout["Publishing & Delivery"]
         Outbound[("Kinesis outbound stream")]
-        ESL["ES lambda"]
-        NL["notif lambda"]
+        ESL["ES lambda writer"]
+        NL["notification lambda"]
         OS[("OpenSearch (ES)")]
         SNS["SNS topics"]
     end
@@ -68,7 +68,7 @@ flowchart LR
     Inbound --> Agg
     Agg -- land denormalized --> Staging
     Staging -- assemble normalized --> Core
-    Agg -- publish --> Outbound
+    Core -- publish --> Outbound
     Outbound --> ESL --> OS
     Outbound --> NL --> SNS
     OS -- query --> Consumers
@@ -87,7 +87,7 @@ Serving many consumers from many upstream sources was difficult because each sid
 
 ## Architecture Approach
 
-The platform funnels all change events into a single **Kinesis inbound stream** (fan-in), aggregates them in one place, and then republishes them through a **Kinesis**utbound stream** (fan-out) to independent delivery paths.
+The platform funnels all change events into a single **Kinesis inbound stream** (fan-in), aggregates them into a normalized CoreData model, and then publishes from those normalized CoreData tables to a **Kinesis outbound stream** (fan-out) to independent delivery paths.
 
 `pub-proxy` acts as the polling-based CDC producer; `pub-aggregator` is the single consumer that owns the write to the system of record and the handoff to the outbound stream. Everything downstream of the outbound stream — search indexing and consumer notification — is an independent, isolated path.
 
@@ -95,7 +95,7 @@ All services are **stateless containers on ECS**, connected only through durable
 
 ## Ingestion & Aggregation Flow
 
-Incoming events are first landed into **denormalized staging tables** (the staging schema can hold many such tables). The **normalized CoreData model is then assembled from multiple staging tables**, producing clean canonical entities — **one entity per CoreData table**. Once the normalized write is complete, the aggregator publishes to the outbound stream.
+Incoming events are first landed into **denormalized staging tables** (the staging schema can hold many such tables). The **normalized CoreData model is then assembled from multiple staging tables**, producing clean canonical entities — **one entity per CoreData table**. Once the normalized write is complete, the change is published to the outbound stream **from the CoreData (normalized) tables** — not from staging.
 
 ```mermaid
 flowchart TD
@@ -114,7 +114,7 @@ flowchart TD
     S3 --> Build
     Build --> Core[("coredata tables<br/>one entity per table")]
 
-    Agg -- publish --> Outbound[("Kinesis outbound stream")]
+    Core -- publish --> Outbound[("Kinesis outbound stream")]
 ```
 
 ## Ingestion Sequence
@@ -135,22 +135,22 @@ sequenceDiagram
     Agg->>Stg: Land data into staging (many denormalized tables)
     Agg->>Core: Assemble normalized entities from multiple staging tables
     Note over Core: one entity per coredata table
-    Agg->>Out: Publish to outbound stream
+    Core->>Out: Publish to outbound stream (from normalized coredata)
 ```
 
 ## Publishing & Delivery Flow
 
 Once `pub-aggregator` completes the normalized write, it publishes the change to the **outbound stream**, which drives two independent delivery paths:
 
-- **ES lambda** indexes the record into **OpenSearch**, so consumers can query the data.
-- **notif lambda** publishes to **SNS topics**, so subscribed consumers are notified that new data has arrived.
+- **ES lambda writer** indexes the record into **OpenSearch**, so consumers can query the data.
+- **notification lambda** publishes to **SNS topics**, so subscribed consumers are notified that new data has arrived.
 
 Consumers therefore receive data two complementary ways — a **push notification** via SNS, and a **queryable index** in OpenSearch.
 
 ```mermaid
 flowchart LR
-    Outbound[("Kinesis outbound stream")] --> ESL["ES lambda"]
-    Outbound --> NL["notif lambda"]
+    Outbound[("Kinesis outbound stream")] --> ESL["ES lambda writer"]
+    Outbound --> NL["notification lambda"]
     ESL --> OS[("OpenSearch (ES)")]
     NL --> SNS["SNS topics"]
     OS -- query --> Con["Consumers"]
@@ -162,9 +162,9 @@ flowchart LR
 ```mermaid
 sequenceDiagram
     participant Out as Kinesis outbound
-    participant ESL as ES lambda
+    participant ESL as ES lambda writer
     participant OS as OpenSearch
-    participant NL as notif lambda
+    participant NL as notification lambda
     participant SNS as SNS topics
     participant Con as Consumer
     Out->>ESL: Deliver outbound record
@@ -191,15 +191,15 @@ Many producers — `pub-proxy`, PST, ESG, and others — publish to one **Kinesi
 
 #### Outbound stream for fan-out
 
-After the normalized write, `pub-aggregator` republishes to a **Kinesis outbound stream**. This cleanly separates *ingestion* from *delivery*: the outbound consumers (search, notification) evolve and fail independently of ingestion.
+After the normalized write completes, the change is published to the **Kinesis outbound stream from the CoreData (normalized) tables** — not from staging. This cleanly separates *ingestion* from *delivery*: the outbound consumers (search, notification) evolve and fail independently of ingestion.
 
 #### Lambda-based delivery
 
-The outbound stream is consumed by lightweight, independently-scaling **lambdas** — one for search indexing (**ES lambda → OpenSearch**) and one for consumer notification (**notif lambda → SNS**) — so each delivery concern is isolated.
+The outbound stream is consumed by lightweight, independently-scaling **lambdas** — one for search indexing (**ES lambda writer → OpenSearch**) and one for consumer notification (**notification lambda → SNS**) — so each delivery concern is isolated.
 
 ## Analytics — Off the Hot Path
 
-Consumers also needed **bulk snapsh**s** of the data for analytics and reporting. Running large scans against the live transactional database would compete with production traffic, so snapshots are produced by a separate scheduled service.
+Consumers also needed **bulk snapshot** of the data for analytics and reporting. Running large scans against the live transactional database would compete with production traffic, so snapshots are produced by a separate scheduled service.
 
 `snapshot-api` reads from **MySQL / MSSQL** on both an **incremental** and a **daily** cadence, generates **CSV**, converts it to columnar **Parquet** using **Spark**, uploads the Parquet to **S3**, and then publishes an **SNS notification containing the S**paths** so consumers know exactly where to pick up the latest snapshot.
 
@@ -271,15 +271,15 @@ As a **backend and cloud engineer**, I designed, built, and supported the CoreDa
 | Area | What I did | Tech stack |
 | --- | --- | --- |
 | **Ingestion / CDC** | Built `pub-proxy`, a Spring Boot service on ECS that polls upstream sources and acts as a CDC producer onto the Kinesis inbound stream | Java, Spring Boot, ECS, Kinesis |
-| **Aggregation** | Owned `pub-aggregator` — the single inbound consumer that lands denormalized data into multiple staging tables, assembles normalized CoreData entities (one per table) in RDS MySQL, and republishes to the outbound stream | Java, Spring Boot, Spring Integration, ECS, Kinesis, RDS MySQL, JPA/Hibernate, Flyway |
-| **Publishing / fan-out** | Built the ES lambda (index into OpenSearch) and notif lambda (publish to SNS) as isolated delivery paths | AWS Lambda, Kinesis, OpenSearch, SNS |
+| **Aggregation** | Owned `pub-aggregator` — the single inbound consumer that lands denormalized data into multiple staging tables, assembles normalized CoreData entities (one per table) in RDS MySQL, and publishes to the outbound stream from the normalized CoreData tables | Java, Spring Boot, Spring Integration, ECS, Kinesis, RDS MySQL, JPA/Hibernate, Flyway |
+| **Publishing / fan-out** | Built the ES lambda writer (index into OpenSearch) and notification lambda (publish to SNS) as isolated delivery paths | AWS Lambda, Kinesis, OpenSearch, SNS |
 | **Analytics** | Developed `snapshot-api` — a Spring Batch job that reads MySQL/MSSQL (incremental & daily), generates CSV, converts to Parquet via Spark, uploads to S3, and notifies consumers with S3 paths via SNS | Java, Spring Boot, Spring Batch, MySQL/MSSQL, Spark, S3, SNS |
 | **APIs & integration** | Developed REST APIs and event-driven components, combining synchronous REST with asynchronous streaming | Spring Boot, REST, Kinesis/SNS/SQS |
 | **Cloud security** | Implemented authentication, authorization, encryption, and secrets management | Cognito, OAuth2/JWT, KMS, Secrets Manager, Parameter Store |
 | **CI/CD & IaC** | Automated build, containerization, deployment, provisioning, and DB migrations | Bitbucket Pipelines, Docker, CloudFormation, Terraform, Gradle, Flyway |
 | **Reliability & ops** | Applied resilient design (centralized config, structured exception handling, health checks, idempotent at-least-once processing); wired in observability and owned production support | CloudWatch, logging, automated testing, Agile |
 
-**In one line:** I built a Spring Boot polling-CDC producer feeding a Kinesis inbound stream, a Spring Boot aggregator that lands denormalized staging data and assembles normalized CoreData entities in RDS MySQL before republishing to a Kinesis outbound stream, and Lambda-based fan-out to OpenSearch and SNS — plus the `snapshot-api` analytics job, and the cloud security, CI/CD, IaC, and observability that made it production-ready.
+**In one line:** I built a Spring Boot polling-CDC producer feeding a Kinesis inbound stream, a Spring Boot aggregator that lands denormalized staging data and assembles normalized CoreData entities in RDS MySQL, then publishes to a Kinesis outbound stream from those normalized CoreData tables, and Lambda-based fan-out (ES lambda writer + notification lambda) to OpenSearch and SNS — plus the `snapshot-api` analytics job, and the cloud security, CI/CD, IaC, and observability that made it production-ready.
 
 
 ## Key Learnings
